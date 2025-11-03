@@ -101,17 +101,7 @@
 
 ---
 
-## 10) Para probar rápido
-1. Alimenta la Nucleo, conecta LCD/Keypad/7-seg/Stepper según el **Mapa de pines**.  
-2. Enciende → debe verse **Libre** en LCD (estado VERDE).  
-3. Pulsa **PA4** (Tren) o **PA12** (Peatón) → transita a AMARILLO y luego ROJO con conteo.  
-4. Desde VERDE, presiona **A** o **B** → edita **MM:SS** y guarda con `#`.  
-5. Abre un monitor serie a **9600 baudios** para ver los eventos.
+## 10) Videos 
 
----
-
-## 11) Videos (YouTube)
-- Funcionamiento del semáforo: _(agrega tu link)_  
-- Recorrido por el código: _(agrega tu link)_
 
 
