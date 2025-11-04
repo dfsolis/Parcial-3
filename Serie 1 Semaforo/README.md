@@ -104,4 +104,5 @@
 ## 10) Videos 
 
 
-
+Explicacion del codigo: https://youtu.be/DMOxnEH23hs
+Video de maqueta funcionando: https://youtube.com/shorts/2vojuXmkTIQ
