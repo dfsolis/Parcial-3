@@ -79,6 +79,7 @@ static void TIM21_Init_1kHz(void);
 static void TIM22_Init_2kHz(void);
 static void USART2_Init(void);
 static void USART2_SendString(const char* s);
+static void mantto_show_menu(void);
 
 /* ====================== LCD asíncrona ====================== */
 typedef enum {LCDI_PWRWAIT=0,LCDI_FN0,LCDI_FN1,LCDI_FN2,LCDI_SET4,LCDI_FUNCSET,LCDI_DISPON,LCDI_CLEAR,LCDI_ENTRY,LCDI_READY} lcd_init_st_t;
@@ -153,18 +154,57 @@ static void UART_SendLabelTime(const char* label,uint16_t secs){
   USART2_SendString(t); USART2_SendString("\r\n");
 }
 
+/* ====================== Buzzer pattern ====================== */
+typedef enum {BUZ_MODE_OFF=0, BUZ_MODE_STEADY, BUZ_MODE_BEEP} buz_mode_t;
+static volatile buz_mode_t g_buz_mode = BUZ_MODE_OFF;
+static volatile uint16_t g_buz_timer_ms = 0;
+static volatile uint8_t  g_buz_phase = 0; /* 0=ON phase, 1=OFF phase */
+#define BEEP_ON_MS   200u
+#define BEEP_OFF_MS  200u
+static inline void buz_set_mode(buz_mode_t m){
+  g_buz_mode = m; g_buz_timer_ms = 0; g_buz_phase = 0;
+  if(m==BUZ_MODE_OFF){ BUZ_OFF(); }
+  else if(m==BUZ_MODE_STEADY){ BUZ_ON(); }
+  else { BUZ_ON(); } /* start beep with ON */
+}
+static inline void buz_service_1ms(void){
+  if(g_buz_mode==BUZ_MODE_OFF){ BUZ_OFF(); return; }
+  if(g_buz_mode==BUZ_MODE_STEADY){ BUZ_ON(); return; }
+  /* BEEP pattern */
+  uint16_t limit = g_buz_phase ? BEEP_OFF_MS : BEEP_ON_MS;
+  if(++g_buz_timer_ms >= limit){
+    g_buz_timer_ms = 0;
+    g_buz_phase ^= 1u;
+    if(g_buz_phase) BUZ_OFF(); else BUZ_ON();
+  }
+}
+
 /* ====================== FSM y mensajes ====================== */
 typedef enum {MODE_TREN=0, MODE_PEATON} sem_mode_t;
-typedef enum {S_VERDE=0, S_AMARILLO, S_ROJO, S_CONFIG_TREN, S_CONFIG_PEATON, S_MSG} sem_state_t;
-typedef enum {LCD_MSG_NONE=0, LCD_MSG_LIBRE, LCD_MSG_PRECAUCION, LCD_MSG_TREN, LCD_MSG_PEATON} lcd_msg_t;
+typedef enum {
+  S_VERDE=0, S_AMARILLO, S_ROJO,
+  S_CONFIG_TREN,
+  S_CONFIG_PEATON,
+  S_CONFIG_PEATON_BUZ,
+  S_CONFIG_PEATON_BAR,
+  S_MSG,
+  S_MANTTO
+} sem_state_t;
 
-static volatile sem_state_t g_state=S_VERDE; static volatile sem_mode_t g_mode=MODE_TREN;
+typedef enum {LCD_MSG_NONE=0, LCD_MSG_LIBRE, LCD_MSG_PRECAUCION, LCD_MSG_TREN, LCD_MSG_PEATON, LCD_MSG_MANTTO} lcd_msg_t;
+
+static volatile sem_state_t g_state=S_VERDE;
+static volatile sem_state_t g_prev_state=S_VERDE;
+static volatile sem_mode_t g_mode=MODE_TREN;
 static volatile uint16_t g_blink_div_ms=0, g_div_1s_ms=0, g_msg_timer_ms=0;
 static volatile uint32_t g_tmr_yellow_ms=0, g_tmr_red_ms=0;
 static volatile lcd_msg_t g_lcd_msg=LCD_MSG_NONE;
 
 /* tiempos configurables */
 static volatile uint16_t g_tren_segundos=30, g_peaton_segundos=20;
+/* flags de PEATÓN configurables en menú */
+static volatile uint8_t g_peaton_buzzer_en=0;
+static volatile uint8_t g_peaton_barrier_en=0;
 
 /* buffer edición MM:SS */
 static uint8_t buf[4]={0,0,3,0}, buf_len=2;
@@ -177,6 +217,17 @@ static void lcd_show_config_value(const char* titulo){
   l2[0]='0'+t[0]; l2[1]='0'+t[1]; l2[2]=':'; l2[3]='0'+t[2]; l2[4]='0'+t[3]; l2[16]='\0';
   lcd_set_cursor_nb(0,0); lcd_enqueue_text_fixed16(titulo);
   lcd_set_cursor_nb(1,0); lcd_enqueue_text_fixed16(l2);
+}
+static void lcd_show_peaton_buzzer_menu(void){
+  lcd_show_two("Peaton: Buzzer","0:Off   1:On   #OK");
+}
+static void lcd_show_peaton_bar_menu(void){
+  lcd_show_two("Peaton: Barrera","0:No    1:Si   #OK");
+}
+
+/* ===== Mantto menu ===== */
+static void mantto_show_menu(void){
+  lcd_show_two("MANTTO: Barrera","0:Abajo 1:Arr   C:Salir");
 }
 
 /* ====================== Stepper ====================== */
@@ -197,8 +248,8 @@ static void stp_service_1ms(void){
   else { stp_idx=(uint8_t)((stp_idx+7)&7); stp_target_steps++; }
   stp_apply(seq8[stp_idx]);
 }
-static inline void stp_right_90(void){ stp_target_steps += STEPS_90; }
-static inline void stp_back_home_90(void){ stp_target_steps -= STEPS_90; }
+static inline void stp_right_90(void){ stp_target_steps += STEPS_90; }   /* subir talanquera */
+static inline void stp_back_home_90(void){ stp_target_steps -= STEPS_90; }/* bajar talanquera */
 
 /* ====================== Keypad (IRQ+TIM21) ====================== */
 #define DEBOUNCE_MS 20u
@@ -228,19 +279,20 @@ static void UART_Announce(sem_state_t st){
   if(st==S_VERDE) USART2_SendString("VERDE\r\n");
   else if(st==S_AMARILLO) USART2_SendString("AMARILLO\r\n");
   else if(st==S_ROJO) USART2_SendString("ROJO\r\n");
+  else if(st==S_MANTTO) USART2_SendString("MANTENIMIENTO\r\n");
 }
 static void Semaforo_Set(sem_state_t st){
-  g_state=st;
+  g_prev_state = g_state;
+  g_state = st;
+
   switch(st){
     case S_VERDE:
       GPIO_SET(LED_VERDE_PORT,LED_VERDE_PIN);
       GPIO_CLR(LED_AMAR_PORT,LED_AMAR_PIN);
       GPIO_CLR(LED_ROJO_PORT,LED_ROJO_PIN);
-      BUZ_OFF();
-      // Antes: if(g_mode==MODE_TREN) stp_back_home_90();
-      // Ahora: posición que antes tenía en ROJO
-      if(g_mode==MODE_TREN) stp_right_90();
-
+      buz_set_mode(BUZ_MODE_OFF);
+      if(g_mode==MODE_TREN){ stp_right_90(); }
+      else if(g_mode==MODE_PEATON && g_peaton_barrier_en){ stp_right_90(); }
       seg_digits[0]=seg_digits[1]=seg_digits[2]=seg_digits[3]=0; digits_all_off();
       LCD_Request(LCD_MSG_LIBRE); UART_Announce(S_VERDE);
     break;
@@ -250,15 +302,17 @@ static void Semaforo_Set(sem_state_t st){
       GPIO_CLR(LED_ROJO_PORT,LED_ROJO_PIN);
       GPIO_SET(LED_AMAR_PORT,LED_AMAR_PIN);
       g_tmr_yellow_ms=3000u; g_blink_div_ms=0u;
+
       if(g_mode==MODE_TREN){
-        BUZ_ON();
-        // Antes: stp_right_90();
-        // Ahora: en el paso hacia ROJO regresa a la posición que antes era de VERDE
+        buz_set_mode(BUZ_MODE_STEADY);
         stp_back_home_90();
+        LCD_Request(LCD_MSG_PRECAUCION);
       } else {
-        BUZ_OFF();
+        buz_set_mode(g_peaton_buzzer_en ? BUZ_MODE_STEADY : BUZ_MODE_OFF);
+        if(g_peaton_barrier_en) stp_back_home_90();
+        LCD_Request(LCD_MSG_PRECAUCION);
       }
-      LCD_Request(LCD_MSG_PRECAUCION); UART_Announce(S_AMARILLO);
+      UART_Announce(S_AMARILLO);
     break;
 
     case S_ROJO: {
@@ -268,12 +322,19 @@ static void Semaforo_Set(sem_state_t st){
       g_div_1s_ms=0;
       uint16_t secs=(g_mode==MODE_TREN)?g_tren_segundos:g_peaton_segundos;
       g_tmr_red_ms=(uint32_t)secs*1000u; seg_show_mmss(secs);
-      if(g_mode==MODE_TREN){ BUZ_ON(); LCD_Request(LCD_MSG_TREN); } else { BUZ_OFF(); LCD_Request(LCD_MSG_PEATON); }
+
+      if(g_mode==MODE_TREN){
+        buz_set_mode(BUZ_MODE_BEEP);            /* pi-silencio-pi... */
+        LCD_Request(LCD_MSG_TREN);
+      } else {
+        buz_set_mode(g_peaton_buzzer_en ? BUZ_MODE_STEADY : BUZ_MODE_OFF);
+        LCD_Request(LCD_MSG_PEATON);
+      }
       UART_Announce(S_ROJO);
     } break;
 
     case S_CONFIG_TREN: {
-      BUZ_OFF();
+      buz_set_mode(BUZ_MODE_OFF);
       uint16_t s=g_tren_segundos; buf[0]=(s/60)/10; buf[1]=(s/60)%10; buf[2]=(s%60)/10; buf[3]=(s%60)%10; buf_len=4;
       lcd_show_two("Tiempo Tren (MM:SS)","               ");
       lcd_show_config_value("Tiempo Tren (MM:SS)");
@@ -281,17 +342,43 @@ static void Semaforo_Set(sem_state_t st){
     } break;
 
     case S_CONFIG_PEATON: {
-      BUZ_OFF();
+      buz_set_mode(BUZ_MODE_OFF);
       uint16_t s=g_peaton_segundos; buf[0]=(s/60)/10; buf[1]=(s/60)%10; buf[2]=(s%60)/10; buf[3]=(s%60)%10; buf_len=4;
-      lcd_show_two("Tiempo Peaton(MM:SS)","               ");
-      lcd_show_config_value("Tiempo Peaton(MM:SS)");
-      USART2_SendString("MENU: Peaton\r\n");
+      lcd_show_two("Peaton: Tiempo","MM:SS  (#=OK)");
+      lcd_show_config_value("Peaton: Tiempo");
+      USART2_SendString("MENU: Peaton (1/3) Tiempo\r\n");
     } break;
 
-    case S_MSG: BUZ_OFF(); break;
+    case S_CONFIG_PEATON_BUZ:
+      buz_set_mode(BUZ_MODE_OFF); lcd_show_peaton_buzzer_menu();
+      USART2_SendString("MENU: Peaton (2/3) Buzzer 0/1\r\n");
+    break;
+
+    case S_CONFIG_PEATON_BAR:
+      buz_set_mode(BUZ_MODE_OFF); lcd_show_peaton_bar_menu();
+      USART2_SendString("MENU: Peaton (3/3) Barrera 0/1\r\n");
+    break;
+
+    case S_MSG:
+      buz_set_mode(BUZ_MODE_OFF);
+    break;
+
+    case S_MANTTO:
+      GPIO_CLR(LED_VERDE_PORT,LED_VERDE_PIN);
+      GPIO_CLR(LED_ROJO_PORT,LED_ROJO_PIN);
+      GPIO_CLR(LED_AMAR_PORT,LED_AMAR_PIN);
+      buz_set_mode(BUZ_MODE_OFF);
+      g_blink_div_ms = 0u;
+      if(g_prev_state != S_VERDE){ stp_right_90(); } /* levantar por seguridad */
+      seg_digits[0]=seg_digits[1]=seg_digits[2]=seg_digits[3]=0;
+      digits_all_off();
+      g_tmr_yellow_ms = 0u;
+      g_tmr_red_ms    = 0u;
+      LCD_Request(LCD_MSG_MANTTO);
+      UART_Announce(S_MANTTO);
+    break;
   }
 }
-
 
 /* ====================== Init HW ====================== */
 static void Clocks_Init(void){
@@ -371,6 +458,7 @@ void TIM21_IRQHandler(void){
 
     stp_service_1ms();
     lcd_service_1ms();
+    buz_service_1ms();
 
     g_scan_col=(uint8_t)((g_scan_col+1u)&0x03u); col_drive_low(g_scan_col);
 
@@ -382,22 +470,76 @@ void TIM21_IRQHandler(void){
           uint8_t rows=read_rows_mask();
           if(((rows>>k_row)&1u)==0){
             char k=map_key_from_rowcol((uint8_t)k_row,(uint8_t)k_col);
+
+            /* --- teclas globales --- */
+            if(k=='C'){
+              if(g_state==S_MANTTO) Semaforo_Set(S_VERDE);
+              else                   Semaforo_Set(S_MANTTO);
+            } else if(k=='D'){
+              /* Cancelar cualquier ciclo activo (AMARILLO o ROJO) y volver a VERDE */
+              if(g_state==S_AMARILLO || g_state==S_ROJO){
+                g_tmr_yellow_ms = 0u;
+                g_tmr_red_ms    = 0u;
+                Semaforo_Set(S_VERDE);
+                USART2_SendString("CANCEL: D -> VERDE\r\n");
+              }
+            } else
+            /* ===== Lógica por estado ===== */
             if(g_state==S_VERDE){
               if(k=='A') Semaforo_Set(S_CONFIG_TREN);
               else if(k=='B') Semaforo_Set(S_CONFIG_PEATON);
-            }else if(g_state==S_CONFIG_TREN || g_state==S_CONFIG_PEATON){
-              if(k>='0' && k<='9'){ buf_push_digit((uint8_t)(k-'0')); lcd_show_config_value( (g_state==S_CONFIG_TREN)?"Tiempo Tren (MM:SS)":"Tiempo Peaton(MM:SS)" ); }
-              else if(k=='*'){ buf_clear(); lcd_show_config_value( (g_state==S_CONFIG_TREN)?"Tiempo Tren (MM:SS)":"Tiempo Peaton(MM:SS)" ); }
+            }
+            else if(g_state==S_CONFIG_TREN){
+              if(k>='0' && k<='9'){ buf_push_digit((uint8_t)(k-'0')); lcd_show_config_value("Tiempo Tren (MM:SS)"); }
+              else if(k=='*'){ buf_clear(); lcd_show_config_value("Tiempo Tren (MM:SS)"); }
               else if(k=='#'){
                 uint8_t mm,ss; buf_to_mmss(&mm,&ss);
                 if(ss<60){
-                  uint16_t secs=(uint16_t)mm*60u+(uint16_t)ss;
-                  if(g_state==S_CONFIG_TREN){ g_tren_segundos=secs; UART_SendLabelTime("TREN tiempo", g_tren_segundos); }
-                  else { g_peaton_segundos=secs; UART_SendLabelTime("PEATON tiempo", g_peaton_segundos); }
+                  g_tren_segundos=(uint16_t)mm*60u+(uint16_t)ss;
+                  UART_SendLabelTime("TREN tiempo", g_tren_segundos);
                   lcd_show_two("Tiempo guardado","Volviendo a VERDE"); g_msg_timer_ms=1000u; g_state=S_MSG;
-                }else lcd_show_two("Segundos < 60","Corrige con *");
+                } else lcd_show_two("Segundos < 60","Corrige con *");
               }
             }
+            else if(g_state==S_CONFIG_PEATON){
+              if(k>='0' && k<='9'){ buf_push_digit((uint8_t)(k-'0')); lcd_show_config_value("Peaton: Tiempo"); }
+              else if(k=='*'){ buf_clear(); lcd_show_config_value("Peaton: Tiempo"); }
+              else if(k=='#'){
+                uint8_t mm,ss; buf_to_mmss(&mm,&ss);
+                if(ss<60){
+                  g_peaton_segundos=(uint16_t)mm*60u+(uint16_t)ss;
+                  UART_SendLabelTime("PEATON tiempo", g_peaton_segundos);
+                  Semaforo_Set(S_CONFIG_PEATON_BUZ);
+                } else lcd_show_two("Segundos < 60","Corrige con *");
+              }
+            }
+            else if(g_state==S_CONFIG_PEATON_BUZ){
+              if(k=='0'){ g_peaton_buzzer_en=0; lcd_show_peaton_buzzer_menu(); USART2_SendString("PEATON buzzer=OFF\r\n"); }
+              else if(k=='1'){ g_peaton_buzzer_en=1; lcd_show_peaton_buzzer_menu(); USART2_SendString("PEATON buzzer=ON\r\n"); }
+              else if(k=='#'){ Semaforo_Set(S_CONFIG_PEATON_BAR); }
+            }
+            else if(g_state==S_CONFIG_PEATON_BAR){
+              if(k=='0'){ g_peaton_barrier_en=0; lcd_show_peaton_bar_menu(); USART2_SendString("PEATON barrera=NO\r\n"); }
+              else if(k=='1'){ g_peaton_barrier_en=1; lcd_show_peaton_bar_menu(); USART2_SendString("PEATON barrera=SI\r\n"); }
+              else if(k=='#'){
+                lcd_show_two("Config Peaton OK","Volviendo a VERDE");
+                USART2_SendString("MENU: Peaton guardado\r\n");
+                g_msg_timer_ms=1000u; g_state=S_MSG;
+              }
+            }
+            else if(g_state==S_MANTTO){
+              /* En mantenimiento: controlar talanquera */
+              if(k=='0'){ /* Abajo */
+                stp_back_home_90();
+                USART2_SendString("MANTTO: barrera=ABAJO\r\n");
+                mantto_show_menu();
+              } else if(k=='1'){ /* Arriba */
+                stp_right_90();
+                USART2_SendString("MANTTO: barrera=ARRIBA\r\n");
+                mantto_show_menu();
+              }
+            }
+
             k_cnt=RELEASE_MS; k_state=K_HELD;
           }else k_state=K_IDLE;
         } break;
@@ -408,13 +550,15 @@ void TIM21_IRQHandler(void){
       } break;
     }
 
+    /* Botones físicos para iniciar ciclos (solo en VERDE) */
     if(g_btn_tren){ g_btn_tren=0; if(g_state==S_VERDE){ g_mode=MODE_TREN; Semaforo_Set(S_AMARILLO); } }
     if(g_btn_peaton){ g_btn_peaton=0; if(g_state==S_VERDE){ g_mode=MODE_PEATON; Semaforo_Set(S_AMARILLO); } }
 
+    /* Timers del semáforo */
     if(g_state==S_AMARILLO){
       if(g_tmr_yellow_ms){
         g_tmr_yellow_ms--;
-        if(++g_blink_div_ms>=250u){ g_blink_div_ms=0u; GPIO_SET(LED_AMAR_PORT,LED_AMAR_PIN); } /* breve reafirmación de ON */
+        if(++g_blink_div_ms>=250u){ g_blink_div_ms=0u; GPIO_SET(LED_AMAR_PORT,LED_AMAR_PIN); }
         if(g_tmr_yellow_ms==0u) Semaforo_Set(S_ROJO);
       }
     }else if(g_state==S_ROJO){
@@ -425,8 +569,16 @@ void TIM21_IRQHandler(void){
       }
     }else if(g_state==S_MSG){
       if(g_msg_timer_ms){ g_msg_timer_ms--; if(!g_msg_timer_ms) Semaforo_Set(S_VERDE); }
+    }else if(g_state==S_MANTTO){
+      /* Parpadeo continuo del LED AMARILLO ~300ms */
+      if(++g_blink_div_ms>=300u){
+        g_blink_div_ms=0u;
+        if( (GPIOC->ODR & (1u<<LED_AMAR_PIN)) ) GPIO_CLR(LED_AMAR_PORT,LED_AMAR_PIN);
+        else                                   GPIO_SET(LED_AMAR_PORT,LED_AMAR_PIN);
+      }
     }
 
+    /* Mensajes LCD pendientes */
     if(lcd_init_st==LCDI_READY && g_lcd_msg!=LCD_MSG_NONE){
       lcd_clear_home();
       if(g_lcd_msg==LCD_MSG_LIBRE){
@@ -441,6 +593,8 @@ void TIM21_IRQHandler(void){
         lcd_enqueue_text_fixed16("Tren pasando");
       }else if(g_lcd_msg==LCD_MSG_PEATON){
         lcd_enqueue_text_fixed16("Paso peatonal");
+      }else if(g_lcd_msg==LCD_MSG_MANTTO){
+        mantto_show_menu();
       }
       g_lcd_msg=LCD_MSG_NONE;
     }
@@ -461,6 +615,7 @@ void TIM22_IRQHandler(void){
   }
 }
 void USART2_IRQHandler(void){
+  static volatile uint8_t utx_head_local; (void)utx_head_local;
   if(USART2->ISR & USART_ISR_TXE){
     if(utx_tail!=utx_head){ USART2->TDR=utxq[utx_tail]; utx_tail=(utx_tail+1)&(UTXQ_SIZE-1); }
     else USART2->CR1 &= ~USART_CR1_TXEIE;
@@ -474,8 +629,20 @@ int main(void){
   TIM21_Init_1kHz(); TIM22_Init_2kHz(); USART2_Init();
   lcd_start_init(); Semaforo_Set(S_VERDE);
   __enable_irq();
-  while(1){ __NOP(); }
+  while(1){ __NOP(); } /* todo por IRQ */
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
